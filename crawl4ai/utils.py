@@ -10,6 +10,9 @@ from html2text import HTML2Text
 from .prompts import PROMPT_EXTRACT_BLOCKS
 from .config import *
 from pathlib import Path
+from urllib.parse import urljoin
+import requests
+from requests.exceptions import InvalidSchema
 
 class InvalidCSSSelectorError(Exception):
     pass
@@ -237,18 +240,104 @@ def get_content_of_website(url, html, word_count_threshold = MIN_WORD_THRESHOLD,
             if tag.name != 'img':
                 tag.attrs = {}
 
+        # Extract meaningful text for images from closest parent
+        def find_closest_parent_with_useful_text(tag):
+            current_tag = tag
+            while current_tag:
+                current_tag = current_tag.parent
+                # Get the text content of the parent tag
+                if current_tag:
+                    text_content = current_tag.get_text(separator='. ',strip=True)
+                    # Check if the text content has at least word_count_threshold
+                    if len(text_content.split()) >= word_count_threshold:
+                        return text_content
+            return None
+        
+        # Fetch image file metadata to extract size and extension
+        def fetch_image_file_size(img,base_url):
+            #If src is relative path construct full URL, if not it may be CDN URL
+            img_url = urljoin(base_url,img.get('src'))
+            try:
+                response = requests.head(img_url)
+                if response.status_code == 200:
+                    return response.headers.get('Content-Length',None)
+                else:
+                    print(f"Failed to retrieve file size for {img_url}")
+                    return None
+            except InvalidSchema as e:
+                print(f"Invalid schema error for image -> {img_url}: {e}")
+            finally:
+                return
+        # Function to parse height value
+        def parse_dimension(dimension):
+            if dimension:
+                match = re.match(r"(\d+)(\D*)", dimension)
+                if match:
+                    number = int(match.group(1))
+                    unit = match.group(2) or 'px'  # Default unit is 'px' if not specified
+                    return number, unit
+            return None, None
+        
+        #Score an image for it's usefulness
+        def score_image_for_usefulness(img,base_url,index,images_count):
+            image_height = img.get('height')
+            height_value, height_unit = parse_dimension(image_height)
+            image_width =  img.get('width')
+            width_value, width_unit = parse_dimension(image_width)
+            image_size = int(fetch_image_file_size(img,base_url) or 0)
+            image_format = os.path.splitext(img.get('src',''))[1].lower()
+            score = 0
+            if height_value:
+                if height_unit == 'px' and height_value > 150:
+                    score += 1
+                if height_unit in ['%','vh','vmin','vmax'] and height_value >30:
+                    score += 1
+            if width_value:
+                if width_unit == 'px' and width_value > 150:
+                    score += 1
+                if width_unit in ['%','vh','vmin','vmax'] and width_value >30:
+                    score += 1
+            if image_size > 10000:
+                score += 1
+            if img.get('alt') != '':
+                score+=1
+            if any(image_format==format for format in ['jpg','png','webp']):
+                score+=1
+            if index/images_count<0.5:
+                score+=1
+            return score
+
         # Extract all img tgas inti [{src: '', alt: ''}]
         media = {
             'images': [],
             'videos': [],
             'audios': []
         }
-        for img in body.find_all('img'):
-            media['images'].append({
-                'src': img.get('src'),
-                'alt': img.get('alt'),
-                "type": "image"
-            })
+        imgs = body.find_all('img')
+        for i,img in enumerate(imgs):
+            style = img.get('style','')
+            src = img.get('src','')
+            alt = img.get('alt','')
+            parent = img.parent
+            parent_tag = parent.name
+            parent_classes = parent.get('class', [])
+            classes_to_check = ['button','icon','logo']
+            tags_to_check=['button','input']
+            #Filter out images with display type none or empty src string
+            if 'display:none' not in style and src:
+                #Filter out images that have parent elements with undesired names in classes or src or alt attrs
+                if not any(s in var for var in [src,alt,*parent_classes] for s in classes_to_check):
+                    #Filter out images inside input, button and anchor elements
+                    if not any(s in parent_tag for s in tags_to_check):
+                        score = score_image_for_usefulness(img,url,i,len(imgs))
+                        if score > 2:
+                            media['images'].append({
+                                'src': src,
+                                'alt': alt,
+                                'desc': find_closest_parent_with_useful_text(img),
+                                'score':score,
+                                "type": "image"
+                            })
             
         # Extract all video tags into [{src: '', alt: ''}]
         for video in body.find_all('video'):
