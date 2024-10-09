@@ -1,13 +1,6 @@
 import pytest
 from unittest.mock import patch, Mock
 import requests
-import os
-import sys
-
-# Add the parent directory to the Python path
-parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append(parent_dir)
-
 from crawl4ai.scraper.filters.content_type_filter import ContentTypeFilter
 
 
