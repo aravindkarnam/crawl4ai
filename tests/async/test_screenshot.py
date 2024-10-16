@@ -1,8 +1,14 @@
+import os
+import sys
 import pytest
+import asyncio
 import base64
 from PIL import Image
 import io
 
+# Add the parent directory to the Python path
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(parent_dir)
 
 from crawl4ai.async_webcrawler import AsyncWebCrawler
 
