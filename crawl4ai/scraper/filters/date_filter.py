@@ -1,6 +1,7 @@
 from datetime import datetime
 import requests
 from .url_filter import URLFilter
+import logging
 
 class DateFilter(URLFilter):
     def __init__(self, min_date: datetime, max_date: datetime):
@@ -12,7 +13,11 @@ class DateFilter(URLFilter):
             response = requests.head(url, timeout=5)
             if 'Last-Modified' in response.headers:
                 last_modified = datetime.strptime(response.headers['Last-Modified'], '%a, %d %b %Y %H:%M:%S GMT')
-                return self.min_date <= last_modified <= self.max_date
+                if self.min_date <= last_modified <= self.max_date:
+                    return True
+                else:
+                    logging.info(f"Skipping {url} as per date filter")
+                    return False
         except requests.RequestException as e:
-            print(f"Error checking last-modified date for {url}: {e}")
+            logging.error(f"Error checking last modified date for {url}: {e} in date filter")
         return False
