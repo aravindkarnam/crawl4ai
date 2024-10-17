@@ -1,7 +1,6 @@
 from .scraper_strategy import ScraperStrategy
 from .filters import FilterChain
 from .scorers import URLScorer
-from .models import ScraperResult
 from ..models import CrawlResult
 from ..async_webcrawler import AsyncWebCrawler
 import asyncio
@@ -13,20 +12,20 @@ from aiolimiter import AsyncLimiter
 from tenacity import retry, stop_after_attempt, wait_exponential
 from collections import defaultdict
 import logging
-from typing import Dict
+from typing import Dict, AsyncGenerator
 logging.basicConfig(level=logging.DEBUG)
 
 rate_limiter = AsyncLimiter(1, 1)  # 1 request per second
 
 class BFSScraperStrategy(ScraperStrategy):
-    def __init__(self, max_depth: int, filter_chain: FilterChain, url_scorer: URLScorer, max_concurrent: int = 5):
+    def __init__(self, max_depth: int, filter_chain: FilterChain, url_scorer: URLScorer, max_concurrent: int = 5, min_crawl_delay: int=1):
         self.max_depth = max_depth
         self.filter_chain = filter_chain
         self.url_scorer = url_scorer
         self.max_concurrent = max_concurrent
         # For Crawl Politeness
         self.last_crawl_time = defaultdict(float)
-        self.min_crawl_delay = 1  # 1 second delay between requests to the same domain
+        self.min_crawl_delay = min_crawl_delay  # 1 second delay between requests to the same domain
         # For Robots.txt Compliance
         self.robot_parsers = {}
 
@@ -38,7 +37,12 @@ class BFSScraperStrategy(ScraperStrategy):
         if netloc not in self.robot_parsers:
             rp = RobotFileParser()
             rp.set_url(f"{scheme}://{netloc}/robots.txt")
-            rp.read()
+            try:
+                rp.read()
+            except Exception as e:
+                # Log the type of error, message, and the URL
+                logging.warning(f"Error {type(e).__name__} occurred while fetching robots.txt for {netloc}: {e}")
+                return None
             self.robot_parsers[netloc] = rp
         return self.robot_parsers[netloc]
 
@@ -48,7 +52,7 @@ class BFSScraperStrategy(ScraperStrategy):
     async def retry_crawl(self, crawler: AsyncWebCrawler, url: str) -> CrawlResult:
         return await crawler.arun(url)
     
-    async def process_url(self, url: str, depth: int, crawler: AsyncWebCrawler, queue: asyncio.PriorityQueue, visited: set, depths: Dict[str, int]) -> CrawlResult:
+    async def process_url(self, url: str, depth: int, crawler: AsyncWebCrawler, queue: asyncio.PriorityQueue, visited: set, depths: Dict[str, int]) -> AsyncGenerator[CrawlResult, None]:
         def normalize_url(url: str) -> str:
             parsed = urlparse(url)
             return urlunparse(parsed._replace(fragment=""))
@@ -59,10 +63,15 @@ class BFSScraperStrategy(ScraperStrategy):
             return None
         
         # Robots.txt Compliance
-        if not self.get_robot_parser(url).can_fetch(crawler.crawler_strategy.user_agent, url):
-            logging.info(f"Skipping {url} as per robots.txt")
-            return None
-        
+        robot_parser = self.get_robot_parser(url)
+        if robot_parser is None:
+            logging.info(f"Could not retrieve robots.txt for {url}, hence proceeding with crawl.")
+        else:
+            # If robots.txt was fetched, check if crawling is allowed
+            if not robot_parser.can_fetch(crawler.crawler_strategy.user_agent, url):
+                logging.info(f"Skipping {url} as per robots.txt")
+                return None
+    
         # Crawl Politeness
         domain = urlparse(url).netloc
         time_since_last_crawl = time.time() - self.last_crawl_time[domain]
@@ -88,8 +97,6 @@ class BFSScraperStrategy(ScraperStrategy):
             elif crawl_result.status_code == 503:
                 await self.add_to_retry_queue(url)
             return crawl_result
-        
-        visited.add(url)
 
         # Process links
         for link_type in ["internal", "external"]:
@@ -103,33 +110,35 @@ class BFSScraperStrategy(ScraperStrategy):
                         score = self.url_scorer.score(normalized_link)
                         await queue.put((score, new_depth, normalized_link))
                         depths[normalized_link] = new_depth
-
         return crawl_result
 
-    async def ascrape(self, start_url: str, crawler: AsyncWebCrawler, parallel_processing:bool = True) -> ScraperResult:
+    async def ascrape(self, start_url: str, crawler: AsyncWebCrawler, parallel_processing:bool = True) -> AsyncGenerator[CrawlResult,None]:
         queue = asyncio.PriorityQueue()
         queue.put_nowait((0, 0, start_url))
         visited = set()
-        extracted_data = {}
         depths = {start_url: 0}
+        pending_tasks = set()
 
-        while not queue.empty():
-            tasks = []
-            while not queue.empty() and len(tasks) < self.max_concurrent:
+        while not queue.empty() or pending_tasks:
+            while not queue.empty() and len(pending_tasks) < self.max_concurrent:
                 _, depth, url = await queue.get()
                 if url not in visited:
+                    # Adding URL to the visited set here itself, (instead of after result generation)
+                    # so that other tasks are not queued for same URL, found at different depth before
+                    # crawling and extraction of this task is completed.
+                    visited.add(url)
                     if parallel_processing:
                         task = asyncio.create_task(self.process_url(url, depth, crawler, queue, visited, depths))
-                        tasks.append(task)
+                        pending_tasks.add(task)
                     else:
                         result = await self.process_url(url, depth, crawler, queue, visited, depths)
                         if result:
-                            extracted_data[result.url] = result
+                            yield result 
 
-            if parallel_processing and tasks:
-                results = await asyncio.gather(*tasks)
-                for result in results:
+            # Wait for the first task to complete and yield results incrementally as each task is completed
+            if pending_tasks:
+                done, pending_tasks = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    result = await task
                     if result:
-                        extracted_data[result.url] = result
-
-        return ScraperResult(url=start_url, crawled_urls=list(visited), extracted_data=extracted_data)
+                        yield result
